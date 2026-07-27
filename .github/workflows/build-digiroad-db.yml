@@ -176,6 +176,13 @@ jobs:
           set -euo pipefail
           sudo apt-get install -y --no-install-recommends sqlite3
 
+          # The version is written into the file itself, so a map knows which
+          # release it came from whether it was downloaded or shipped inside
+          # the app. Stamping it before hashing keeps the manifest honest.
+          tag="digiroad-${{ steps.release.outputs.number }}-${{ github.run_number }}"
+          sqlite3 speedlimits-finland.db \
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('release_tag', '${tag}');"
+
           sqlite3 speedlimits-finland.db 'PRAGMA integrity_check;' | grep -qx ok
 
           segments=$(sqlite3 speedlimits-finland.db 'SELECT COUNT(*) FROM segment;')
@@ -198,6 +205,7 @@ jobs:
           fi
 
           {
+            echo "tag=${tag}"
             echo "segments=${segments}"
             echo "official=${official}"
             echo "sha256=$(sha256sum speedlimits-finland.db | cut -d' ' -f1)"
@@ -209,7 +217,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag="digiroad-${{ steps.release.outputs.number }}-${{ github.run_number }}"
+          tag="${{ steps.verify.outputs.tag }}"
           repo="${GITHUB_REPOSITORY}"
 
           cat > manifest.json <<JSON
