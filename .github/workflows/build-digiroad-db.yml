@@ -1,0 +1,235 @@
+name: Build Digiroad speed limit database
+
+on:
+  workflow_dispatch:
+    inputs:
+      tolerance:
+        description: Geometry simplification tolerance in metres
+        default: '3'
+        required: true
+      skip:
+        description: Regions to leave out, separated by spaces
+        default: AHVENANMAA
+        required: false
+
+concurrency:
+  group: digiroad-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RELEASE_DIR: ava/Tie/Digiroad/Aineistojulkaisut/latest
+  REGION_DIR: ava/Tie/Digiroad/Aineistojulkaisut/latest/Maakuntajako_digiroad_K
+  # The portal hands out a session cookie and redirects back to the same URL
+  # until it is sent again, so every request has to share one jar.
+  COOKIES: /tmp/ava-cookies.txt
+
+jobs:
+  build:
+    name: Build and publish database
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        working-directory: tools/build-speeddb
+        run: npm install --no-audit --no-fund
+
+      - name: Run tests
+        working-directory: tools/build-speeddb
+        run: npm test
+
+      - name: Free up disk space
+        run: |
+          # The Digiroad release unpacks to several gigabytes, so the toolchains
+          # the runner preinstalls are cleared out first.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h /
+
+      - name: Read release number
+        id: release
+        run: |
+          set -euo pipefail
+          number=$(curl -fsSL --compressed -c "$COOKIES" -b "$COOKIES" \
+            "https://ava.vaylapilvi.fi/api/download/${RELEASE_DIR}/irrotus_nro.txt" | tr -dc '0-9_')
+          echo "Digiroad release: ${number}"
+          echo "number=${number:-unknown}" >> "$GITHUB_OUTPUT"
+
+      - name: Convert regions
+        id: convert
+        env:
+          SKIP: ${{ inputs.skip }}
+        run: |
+          set -euo pipefail
+
+          # The listing is served gzipped, and the folder metadata only points
+          # at a signed URL that holds the actual JSON.
+          listing=$(curl -fsSL --compressed -c "$COOKIES" -b "$COOKIES" \
+            "https://ava.vaylapilvi.fi/api/hakemisto/${REGION_DIR}" | jq -r .url)
+          regions=$(curl -fsSL --compressed "$listing" \
+            | jq -r '.[] | .subKey | select(endswith(".zip"))' | sort)
+
+          if [ -z "$regions" ]; then
+            echo "::error::The release listing held no region archives."
+            exit 1
+          fi
+          echo "Found $(wc -l <<<"$regions") regions"
+
+          # The portal drops connections when archives are pulled back to back,
+          # and curl leaves transfer errors like a reset peer unretried unless
+          # it is told otherwise. Each region therefore gets several attempts,
+          # backing off further each time, and a stalled transfer is abandoned
+          # rather than left to hang.
+          download_region() {
+            local region="$1" attempt
+            for attempt in 1 2 3 4 5; do
+              if curl -fSL --retry 3 --retry-delay 5 --retry-all-errors \
+                --connect-timeout 30 --speed-limit 1024 --speed-time 120 \
+                -c "$COOKIES" -b "$COOKIES" -o region.zip \
+                "https://ava.vaylapilvi.fi/api/download/${REGION_DIR}/${region}"; then
+                return 0
+              fi
+              echo "::warning::${region}: download attempt ${attempt} failed"
+              rm -f region.zip
+              sleep $((attempt * 20))
+            done
+            return 1
+          }
+
+          mkdir -p parts
+          index=0
+          for region in $regions; do
+            name="${region%.zip}"
+            if grep -qw "$name" <<<"${SKIP}"; then
+              echo "::notice::Skipping ${name}"
+              continue
+            fi
+
+            index=$((index + 1))
+            echo "::group::${name}"
+
+            download_region "$region"
+
+            # Only the road links and the speed limit attributes are needed.
+            # Unpacking the rest would cost several gigabytes per region.
+            rm -rf work
+            unzip -q -j region.zip \
+              '*/DR_LINKKI_K.shp' '*/DR_LINKKI_K.shx' '*/DR_LINKKI_K.dbf' \
+              '*/DR_NOPEUSRAJOITUS_K.dbf' -d work
+            rm region.zip
+
+            node tools/build-speeddb/digiroad.mjs \
+              --input work \
+              --output "parts/${index}.geojsonseq" \
+              --id-base $((index * 50000000))
+
+            rm -rf work
+            df -h / | tail -1
+            echo "::endgroup::"
+          done
+
+          if [ "$index" -eq 0 ]; then
+            echo "::error::No regions were converted."
+            exit 1
+          fi
+
+          cat parts/*.geojsonseq > roads.geojsonseq
+          rm -rf parts
+          ls -lh roads.geojsonseq
+          echo "regions=${index}" >> "$GITHUB_OUTPUT"
+
+      - name: Build database
+        working-directory: tools/build-speeddb
+        run: |
+          # Without pipefail the exit status comes from `tee`, so a failed build
+          # would be reported as success and published as an empty database.
+          set -o pipefail
+          node build.mjs \
+            --input ../../roads.geojsonseq \
+            --output ../../speedlimits-finland.db \
+            --region finland-digiroad \
+            --tolerance "${TOLERANCE}" | tee ../../build-log.txt
+        env:
+          TOLERANCE: ${{ inputs.tolerance }}
+
+      - name: Verify database
+        id: verify
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends sqlite3
+
+          sqlite3 speedlimits-finland.db 'PRAGMA integrity_check;' | grep -qx ok
+
+          segments=$(sqlite3 speedlimits-finland.db 'SELECT COUNT(*) FROM segment;')
+          official=$(sqlite3 speedlimits-finland.db 'SELECT COUNT(*) FROM segment WHERE source = 0;')
+          echo "Segments: ${segments}"
+          echo "Official: ${official}"
+
+          # An empty database passes an integrity check, so the contents are
+          # checked too. Finland has well over a million road segments.
+          if [ "$segments" -lt 500000 ]; then
+            echo "::error::Only ${segments} segments were built."
+            exit 1
+          fi
+
+          # The whole point of Digiroad is that the limits are recorded rather
+          # than guessed. A low share means the join or the source data broke.
+          if [ "$((official * 100 / segments))" -lt 70 ]; then
+            echo "::error::Only ${official} of ${segments} limits are official."
+            exit 1
+          fi
+
+          {
+            echo "segments=${segments}"
+            echo "official=${official}"
+            echo "sha256=$(sha256sum speedlimits-finland.db | cut -d' ' -f1)"
+            echo "bytes=$(stat -c %s speedlimits-finland.db)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="digiroad-${{ steps.release.outputs.number }}-${{ github.run_number }}"
+          repo="${GITHUB_REPOSITORY}"
+
+          cat > manifest.json <<JSON
+          {
+            "tag": "${tag}",
+            "region": "finland-digiroad",
+            "digiroadRelease": "${{ steps.release.outputs.number }}",
+            "schemaVersion": 1,
+            "bytes": ${{ steps.verify.outputs.bytes }},
+            "sha256": "${{ steps.verify.outputs.sha256 }}",
+            "segments": ${{ steps.verify.outputs.segments }},
+            "official": ${{ steps.verify.outputs.official }},
+            "url": "https://github.com/${repo}/releases/download/${tag}/speedlimits-finland.db"
+          }
+          JSON
+
+          {
+            echo "Offline speed limit database for Finland, built from official records."
+            echo
+            echo "Source: Digiroad ${{ steps.release.outputs.number }}, Finnish Transport"
+            echo "Infrastructure Agency (Vaylavirasto), licensed CC BY 4.0."
+            echo
+            echo "Regions: ${{ steps.convert.outputs.regions }}"
+            echo "Official limits: ${{ steps.verify.outputs.official }} of ${{ steps.verify.outputs.segments }} segments"
+            echo
+            echo '```'
+            cat build-log.txt
+            echo '```'
+          } > notes.md
+
+          gh release create "$tag" \
+            speedlimits-finland.db manifest.json \
+            --repo "$repo" \
+            --title "Speed limit database: Finland, Digiroad ${{ steps.release.outputs.number }}" \
+            --notes-file notes.md
