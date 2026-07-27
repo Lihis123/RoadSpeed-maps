@@ -1,6 +1,10 @@
 name: Build Digiroad speed limit database
 
 on:
+  schedule:
+    # Digiroad appears a few times a year with no fixed date, so the release
+    # number is checked weekly and a build only starts when it has moved on.
+    - cron: '17 5 * * 1'
   workflow_dispatch:
     inputs:
       tolerance:
@@ -33,27 +37,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 22
-
-      - name: Install dependencies
-        working-directory: tools/build-speeddb
-        run: npm install --no-audit --no-fund
-
-      - name: Run tests
-        working-directory: tools/build-speeddb
-        run: npm test
-
-      - name: Free up disk space
-        run: |
-          # The Digiroad release unpacks to several gigabytes, so the toolchains
-          # the runner preinstalls are cleared out first.
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
-          df -h /
-
+      # Asked first so a weekly poll that finds nothing new costs seconds
+      # instead of installing a toolchain it is not going to use.
       - name: Read release number
         id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           number=$(curl -fsSL --compressed -c "$COOKIES" -b "$COOKIES" \
@@ -61,10 +50,49 @@ jobs:
           echo "Digiroad release: ${number}"
           echo "number=${number:-unknown}" >> "$GITHUB_OUTPUT"
 
+          # A scheduled run is only a poll: rebuilding a release that is already
+          # published would burn half an hour and hand the phone an identical
+          # map under a new tag, prompting a pointless 113 MB download.
+          build=yes
+          if [ "${{ github.event_name }}" = schedule ]; then
+            if gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
+              | grep -q "digiroad-${number}-"; then
+              echo "::notice::Digiroad ${number} is already published; nothing to build."
+              build=no
+            else
+              echo "::notice::Digiroad ${number} is new; building."
+            fi
+          fi
+          echo "build=${build}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v7
+        if: steps.release.outputs.build == 'yes'
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        if: steps.release.outputs.build == 'yes'
+        working-directory: tools/build-speeddb
+        run: npm install --no-audit --no-fund
+
+      - name: Run tests
+        if: steps.release.outputs.build == 'yes'
+        working-directory: tools/build-speeddb
+        run: npm test
+
+      - name: Free up disk space
+        if: steps.release.outputs.build == 'yes'
+        run: |
+          # The Digiroad release unpacks to several gigabytes, so the toolchains
+          # the runner preinstalls are cleared out first.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h /
+
       - name: Convert regions
         id: convert
+        if: steps.release.outputs.build == 'yes'
         env:
-          SKIP: ${{ inputs.skip }}
+          SKIP: ${{ inputs.skip || 'AHVENANMAA' }}
         run: |
           set -euo pipefail
 
@@ -157,6 +185,7 @@ jobs:
           echo "regions=${regions}" >> "$GITHUB_OUTPUT"
 
       - name: Build database
+        if: steps.release.outputs.build == 'yes'
         working-directory: tools/build-speeddb
         run: |
           # Without pipefail the exit status comes from `tee`, so a failed build
@@ -168,10 +197,11 @@ jobs:
             --region finland-digiroad \
             --tolerance "${TOLERANCE}" | tee ../../build-log.txt
         env:
-          TOLERANCE: ${{ inputs.tolerance }}
+          TOLERANCE: ${{ inputs.tolerance || '3' }}
 
       - name: Verify database
         id: verify
+        if: steps.release.outputs.build == 'yes'
         run: |
           set -euo pipefail
           sudo apt-get install -y --no-install-recommends sqlite3
@@ -213,6 +243,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Publish release
+        if: steps.release.outputs.build == 'yes'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
