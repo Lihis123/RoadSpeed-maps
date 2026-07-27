@@ -2,3 +2,6 @@ node_modules/
 *.db
 *.geojsonseq
 *.zip
+
+# The build test reads a small checked-in extract.
+!tools/build-speeddb/fixtures/*.geojsonseq

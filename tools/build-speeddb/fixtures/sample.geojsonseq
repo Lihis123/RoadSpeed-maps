@@ -1,0 +1,8 @@
+{"type":"Feature","id":"w1","properties":{"highway":"motorway","maxspeed":"120"},"geometry":{"type":"LineString","coordinates":[[25.0,60.0],[25.0,60.001],[25.0,60.002],[25.0,60.003]]}}
+{"type":"Feature","id":"w2","properties":{"highway":"residential"},"geometry":{"type":"LineString","coordinates":[[24.9,60.2],[24.901,60.2005]]}}
+{"type":"Feature","id":"w3","properties":{"highway":"primary","maxspeed":"100","maxspeed:conditional":"80 @ (Oct 15-Apr 15)","oneway":"yes"},"geometry":{"type":"LineString","coordinates":[[25.5,61.0],[25.52,61.01],[25.54,61.03]]}}
+{"type":"Feature","id":"w4","properties":{"highway":"path"},"geometry":{"type":"LineString","coordinates":[[25.0,60.0],[25.1,60.1]]}}
+{"type":"Feature","id":"w5","properties":{"highway":"service"},"geometry":{"type":"LineString","coordinates":[[25.0,60.0],[25.001,60.0]]}}
+{"type":"Feature","id":"w6","properties":{"highway":"tertiary","maxspeed":"signals"},"geometry":{"type":"LineString","coordinates":[[26.0,62.0],[26.001,62.0005]]}}
+{"type":"Feature","id":"w7","properties":{"highway":"residential"},"geometry":{"type":"Point","coordinates":[25.0,60.0]}}
+{"type":"Feature","properties":{"@id":"w8","highway":"secondary","maxspeed":"60"},"geometry":{"type":"LineString","coordinates":[[24.5,60.5],[24.502,60.5005]]}}
