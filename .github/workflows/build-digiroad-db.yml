@@ -72,14 +72,14 @@ jobs:
           # at a signed URL that holds the actual JSON.
           listing=$(curl -fsSL --compressed -c "$COOKIES" -b "$COOKIES" \
             "https://ava.vaylapilvi.fi/api/hakemisto/${REGION_DIR}" | jq -r .url)
-          regions=$(curl -fsSL --compressed "$listing" \
+          regions_list=$(curl -fsSL --compressed "$listing" \
             | jq -r '.[] | .subKey | select(endswith(".zip"))' | sort)
 
-          if [ -z "$regions" ]; then
+          if [ -z "$regions_list" ]; then
             echo "::error::The release listing held no region archives."
             exit 1
           fi
-          echo "Found $(wc -l <<<"$regions") regions"
+          echo "Found $(wc -l <<<"$regions_list") regions"
 
           # The portal drops connections when archives are pulled back to back,
           # and curl leaves transfer errors like a reset peer unretried unless
@@ -103,38 +103,50 @@ jobs:
           }
 
           mkdir -p parts
-          index=0
-          for region in $regions; do
+          regions=0
+          part=0
+          for region in $regions_list; do
             name="${region%.zip}"
             if grep -qw "$name" <<<"${SKIP}"; then
               echo "::notice::Skipping ${name}"
               continue
             fi
 
-            index=$((index + 1))
+            regions=$((regions + 1))
             echo "::group::${name}"
 
             download_region "$region"
 
             # Only the road links and the speed limit attributes are needed.
             # Unpacking the rest would cost several gigabytes per region.
+            # The folder structure is kept: some provinces are delivered as
+            # several sub-areas that each carry their own copy of the layers,
+            # and flattening them would make the names collide.
             rm -rf work
-            unzip -q -j region.zip \
-              '*/DR_LINKKI_K.shp' '*/DR_LINKKI_K.shx' '*/DR_LINKKI_K.dbf' \
-              '*/DR_NOPEUSRAJOITUS_K.dbf' -d work
+            unzip -q -o region.zip \
+              '*DR_LINKKI_K.shp' '*DR_LINKKI_K.shx' '*DR_LINKKI_K.dbf' \
+              '*DR_NOPEUSRAJOITUS_K.dbf' -d work
             rm region.zip
 
-            node tools/build-speeddb/digiroad.mjs \
-              --input work \
-              --output "parts/${index}.geojsonseq" \
-              --id-base $((index * 50000000))
+            while IFS= read -r dir; do
+              part=$((part + 1))
+              node tools/build-speeddb/digiroad.mjs \
+                --input "$dir" \
+                --output "parts/${part}.geojsonseq" \
+                --id-base $((part * 50000000))
+            done < <(find work -name DR_LINKKI_K.shp -printf '%h\n' | sort)
+
+            if [ "$part" -eq 0 ]; then
+              echo "::error::${name} held no road links."
+              exit 1
+            fi
 
             rm -rf work
             df -h / | tail -1
             echo "::endgroup::"
           done
 
-          if [ "$index" -eq 0 ]; then
+          if [ "$regions" -eq 0 ]; then
             echo "::error::No regions were converted."
             exit 1
           fi
@@ -142,7 +154,7 @@ jobs:
           cat parts/*.geojsonseq > roads.geojsonseq
           rm -rf parts
           ls -lh roads.geojsonseq
-          echo "regions=${index}" >> "$GITHUB_OUTPUT"
+          echo "regions=${regions}" >> "$GITHUB_OUTPUT"
 
       - name: Build database
         working-directory: tools/build-speeddb
